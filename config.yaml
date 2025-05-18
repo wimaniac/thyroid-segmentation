@@ -1,0 +1,17 @@
+data:
+    processed:
+      image:
+        train: data/processed/image/train
+        val: data/processed/image/val
+        test: data/processed/image/test
+      mask:
+        train: data/processed/mask/train
+        val: data/processed/mask/val
+        test: data/processed/mask/test
+training:
+    batch_size: 16
+    learning_rate: 0.001
+    epochs: 50
+    patience: 5
+model:
+    name: unet
