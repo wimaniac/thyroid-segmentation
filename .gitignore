@@ -1,1 +1,7 @@
-"checkpoints/" 
+echo "checkpoints/" >> .gitignore
+echo "*.jpg" >> .gitignore
+echo "*.npy" >> .gitignore
+echo "*.png" >> .gitignore
+echo "*.log" >> .gitignore
+echo "__pycache__/" >> .gitignore
+echo "*.pyc" >> .gitignore
