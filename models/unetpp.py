@@ -1,96 +1,109 @@
 import torch
 import torch.nn as nn
+import torchvision.models as models
+from torchvision.models import ResNet18_Weights
+from torchvision.models.resnet import ResNet34_Weights
 
 
 class UNetPlusPlus(nn.Module):
-    def __init__(self, in_channels=1, out_channels=1, features=[64, 128, 256, 512], deep_supervision=True):
+    def __init__(self, num_classes=1, dropout_rate=0.2):
+        """
+        UNet++ with ResNet34 backbone.
+
+        Args:
+            num_classes (int): Number of output classes (default: 1 for binary segmentation).
+            dropout_rate (float): Dropout rate for regularization.
+        """
         super(UNetPlusPlus, self).__init__()
-        self.deep_supervision = deep_supervision
-        self.features = features
-        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.backbone = models.resnet34(weights=ResNet34_Weights.IMAGENET1K_V1)
 
-        # Encoder
-        self.encoder = nn.ModuleList()
-        for feature in features:
-            self.encoder.append(self.conv_block(in_channels, feature))
-            in_channels = feature
+        # Modify initial convolution to accept single-channel input
+        self.initial_conv = nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
 
-        # Bottleneck
-        self.bottleneck = self.conv_block(features[-1], features[-1] * 2)
+        # Encoder layers from ResNet34
+        self.encoder1 = nn.Sequential(
+            self.initial_conv,
+            nn.BatchNorm2d(64),
+            self.backbone.bn1,
+            self.backbone.relu
+        )
+        self.encoder2 = self.backbone.layer1  # 64 channels
+        self.encoder3 = self.backbone.layer2  # 128 channels
+        self.encoder4 = self.backbone.layer3  # 256 channels
+        self.encoder5 = self.backbone.layer4  # 512 channels
 
-        # Decoder (nested nodes X^{i,j})
-        self.decoder = nn.ModuleDict()
-        for i in range(len(features)):  # Tầng (0, 1, 2, 3)
-            for j in range(1, len(features) - i):  # Node trong tầng (j=1,2,3)
-                in_ch = features[i] * (j + 1)  # Số kênh đầu vào = features[i] * (1 từ upsample + j từ skip)
-                self.decoder[f"X_{i}_{j}"] = self.conv_block(in_ch, features[i])
-                if i < len(features) - 1:  # Không cần upsample cho tầng cuối
-                    self.decoder[f"up_{i}_{j}"] = nn.ConvTranspose2d(features[i], features[i], kernel_size=2, stride=2)
+        # Pooling
+        self.pool = nn.MaxPool2d(2, 2)
 
-        # Deep supervision outputs
-        self.supervision_heads = nn.ModuleList()
-        if deep_supervision:
-            for j in range(1, len(features)):
-                self.supervision_heads.append(nn.Conv2d(features[0], out_channels, kernel_size=1))
+        # Nested decoder blocks
+        self.decoder4_0 = self._conv_block(512, 256, dropout_rate)
+        self.decoder3_0 = self._conv_block(256, 128, dropout_rate)
+        self.decoder3_1 = self._conv_block(256 + 128, 128, dropout_rate)
+        self.decoder2_0 = self._conv_block(128, 64, dropout_rate)
+        self.decoder2_1 = self._conv_block(128 + 64, 64, dropout_rate)
+        self.decoder2_2 = self._conv_block(128 + 64 + 64, 64, dropout_rate)
+        self.decoder1_0 = self._conv_block(64, 32, dropout_rate)
+        self.decoder1_1 = self._conv_block(64 + 32, 32, dropout_rate)
+        self.decoder1_2 = self._conv_block(64 + 32 + 32, 32, dropout_rate)
+        self.decoder1_3 = self._conv_block(64 + 32 + 32 + 32, 32, dropout_rate)
 
-        # Final output (X^{0,0})
-        self.final_conv = nn.Conv2d(features[0], out_channels, kernel_size=1)
+        # Upsampling layers to restore resolution
+        self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+        self.up_final = nn.Upsample(size=(256, 256), mode='bilinear', align_corners=True)
 
-    def conv_block(self, in_channels, out_channels):
+        # Final convolution
+        self.final_conv = nn.Conv2d(32, num_classes, kernel_size=1)
+
+    def _conv_block(self, in_channels, out_channels, dropout_rate):
         return nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
             nn.BatchNorm2d(out_channels),
             nn.ReLU(inplace=True),
-            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
             nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True)
+            nn.ReLU(inplace=True),
+            nn.Dropout2d(dropout_rate)
         )
 
     def forward(self, x):
-        # Encoder
-        enc_features = []
-        for enc in self.encoder:
-            x = enc(x)
-            enc_features.append(x)
-            x = self.pool(x)
-        x = self.bottleneck(x)
-        enc_features.append(x)
+        # Encoder path
+        x1 = self.initial_conv(x)  # Replace ResNet's conv1 for 1-channel input
+        x1 = self.backbone.bn1(x1)
+        x1 = self.backbone.relu(x1)  # 128x128
+        x2 = self.pool(x1)  # 64x64
+        x2 = self.encoder2(x2)  # 64 channels, 64x64
+        x3 = self.encoder3(x2)  # 128 channels, 32x32
+        x4 = self.encoder4(x3)  # 256 channels, 16x16
+        x5 = self.encoder5(x4)  # 512 channels, 8x8
 
-        # Decoder (nested nodes)
-        nodes = {}
-        for i in range(len(self.features) - 1, -1, -1):  # Tầng: 3, 2, 1, 0
-            for j in range(len(self.features) - i):  # Node: 0, 1, 2, 3
-                if j == 0:  # Node X^{i,0} (encoder)
-                    nodes[f"X_{i}_0"] = enc_features[i]
-                else:
-                    # Concatenate inputs
-                    inputs = [nodes[f"X_{i}_{j - 1}"]]  # Từ node trước trong cùng tầng
-                    if i < len(self.features) - 1:  # Từ node dưới (upsample)
-                        up_key = f"up_{i + 1}_{j - 1}"
-                        upsampled = self.decoder[up_key](nodes[f"X_{i + 1}_{j - 1}"])
-                        inputs.append(upsampled)
-                    x = torch.cat(inputs, dim=1)
-                    # Apply conv block
-                    x = self.decoder[f"X_{i}_{j}"](x)
-                    nodes[f"X_{i}_{j}"] = x
+        # Decoder path (UNet++ nested structure)
+        x4_0 = self.decoder4_0(x5)  # 256 channels, 8x8
+        x4_0 = self.up(x4_0)  # 256 channels, 16x16
 
-        # Deep supervision outputs
-        outputs = []
-        if self.deep_supervision:
-            for j in range(1, len(self.features)):
-                out = self.supervision_heads[j - 1](nodes[f"X_0_{j}"])
-                out = nn.functional.interpolate(out, size=nodes[f"X_0_0"].shape[2:], mode='bilinear',
-                                                align_corners=False)
-                outputs.append(out)
+        x3_0 = self.decoder3_0(x4)  # 128 channels, 16x16
+        x3_1 = self.decoder3_1(torch.cat([x3_0, x4_0], dim=1))  # 128 + 256 -> 128, 16x16
+        x3_1 = self.up(x3_1)  # 128 channels, 32x32
 
-        # Final output
-        final_out = self.final_conv(nodes[f"X_0_0"])
-        outputs.append(final_out)
+        x2_0 = self.decoder2_0(x3)  # 64 channels, 32x32
+        x2_1 = self.decoder2_1(torch.cat([x2_0, x3_1], dim=1))  # 64 + 128 -> 64, 32x32
+        x2_2 = self.decoder2_2(torch.cat([x2_0, x2_1, x3_1], dim=1))  # 64 + 64 + 128 -> 64, 32x32
+        x2_2 = self.up(x2_2)  # 64 channels, 64x64
 
-        # Return outputs
-        if self.deep_supervision and self.training:
-            return [torch.sigmoid(out) for out in outputs]
-        return torch.sigmoid(final_out)
+        x1_0 = self.decoder1_0(x2)  # 32 channels, 64x64
+        x1_1 = self.decoder1_1(torch.cat([x1_0, x2_2], dim=1))  # 32 + 64 -> 32, 64x64
+        x1_2 = self.decoder1_2(torch.cat([x1_0, x1_1, x2_2], dim=1))  # 32 + 32 + 64 -> 32, 64x64
+        x1_3 = self.decoder1_3(torch.cat([x1_0, x1_1, x1_2, x2_2], dim=1))  # 32 + 32 + 32 + 64 -> 32, 64x64
+
+        # Final upsampling to 256x256
+        x1_3 = self.up_final(x1_3)  # 32 channels, 256x256
+
+        # Output
+        out = self.final_conv(x1_3)  # 1 channel, 256x256
+        return out
 
 
-
+if __name__ == "__main__":
+    model = UNetPlusPlus(num_classes=1)
+    x = torch.randn(1, 1, 256, 256)
+    output = model(x)
+    print(f"Output shape: {output.shape}")

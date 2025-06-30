@@ -1,17 +1,22 @@
 data:
-    processed:
-      image:
-        train: data/processed/image/train
-        val: data/processed/image/val
-        test: data/processed/image/test
-      mask:
-        train: data/processed/mask/train
-        val: data/processed/mask/val
-        test: data/processed/mask/test
+  processed:
+    image:
+      train: data/processed/train/image
+      val: data/processed/val/image
+      test: data/tn3k/test-image
+    mask:
+      train: data/processed/train/mask
+      val: data/processed/val/mask
+      test: data/tn3k/test-mask
 training:
-    batch_size: 16
-    learning_rate: 0.001
-    epochs: 50
-    patience: 5
-model:
-    name: unet
+  batch_size: 32
+  learning_rate: 0.0005
+  epochs: 50
+  patience: 15
+  weight_decay: 0
+  fine_tune_schedule:
+    5: ['layer4']
+    10: ['layer3']
+    15: ['layer2']
+    20: ['layer1', 'initial_conv']
+

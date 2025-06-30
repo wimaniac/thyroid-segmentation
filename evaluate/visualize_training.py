@@ -1,9 +1,45 @@
 import argparse
 import os
-import csv
 import re
 import matplotlib.pyplot as plt
+import torch
+import sys
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))  # Thêm đường dẫn đến thư mục cha
+from models.unet import UNet, PretrainedUNet
+# from models.deeplabv3 import DeepLabV3
+from train.utils import load_checkpoint
+from models.unetpp import UNetPlusPlus
 
+def get_unique_filename(base_path):
+    """Tạo tên file duy nhất bằng cách thêm số thứ tự nếu file đã tồn tại."""
+    base, ext = os.path.splitext(base_path)
+    counter = 1
+    new_path = base_path
+    while os.path.exists(new_path):
+        new_path = f"{base}_{counter}{ext}"
+        counter += 1
+    return new_path
+
+def get_unique_dir(base_dir):
+    """Tạo tên thư mục duy nhất bằng cách thêm số thứ tự nếu thư mục đã tồn tại."""
+    counter = 1
+    new_dir = base_dir
+    while os.path.exists(new_dir):
+        new_dir = f"{base_dir}_{counter}"
+        counter += 1
+    return new_dir
+
+def get_model(model_name, in_channels=1, out_channels=1):
+    """Khởi tạo mô hình dựa trên tên."""
+    model_map = {
+        'unet': UNet,
+        'pretrained_unet': PretrainedUNet,
+        'unetpppretrained': UNetPlusPlus,
+        # 'deeplabv3': DeepLabV3
+    }
+    if model_name not in model_map:
+        raise ValueError(f"Model {model_name} not supported. Choose from {list(model_map.keys())}")
+    return model_map[model_name](in_channels=in_channels, out_channels=out_channels)
 
 def parse_log_file(log_file):
     """Trích xuất metrics từ file log nếu không có CSV."""
@@ -41,34 +77,11 @@ def parse_log_file(log_file):
         'val_iou': val_ious
     }
 
-
-def read_metrics_csv(csv_file):
-    """Đọc metrics từ file CSV."""
-    metrics = {
-        'epochs': [],
-        'train_loss': [],
-        'train_dice': [],
-        'train_iou': [],
-        'val_loss': [],
-        'val_dice': [],
-        'val_iou': []
-    }
-    with open(csv_file, 'r') as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            metrics['epochs'].append(int(row['epoch']))
-            metrics['train_loss'].append(float(row['train_loss']))
-            metrics['train_dice'].append(float(row['train_dice']))
-            metrics['train_iou'].append(float(row['train_iou']))
-            metrics['val_loss'].append(float(row['val_loss']))
-            metrics['val_dice'].append(float(row['val_dice']))
-            metrics['val_iou'].append(float(row['val_iou']))
-    return metrics
-
-
 def plot_metrics(metrics, model_name, save_dir):
     """Vẽ và lưu biểu đồ."""
-    os.makedirs(save_dir, exist_ok=True)
+    # Tạo thư mục con theo tên mô hình với hậu tố nếu cần
+    model_save_dir = get_unique_dir(os.path.join(save_dir, model_name))
+    os.makedirs(model_save_dir, exist_ok=True)
 
     # Plot Loss
     plt.figure(figsize=(10, 5))
@@ -79,7 +92,8 @@ def plot_metrics(metrics, model_name, save_dir):
     plt.title(f'{model_name.upper()} Training Loss')
     plt.legend()
     plt.grid(True)
-    plt.savefig(os.path.join(save_dir, f'{model_name}_loss.png'))
+    loss_path = get_unique_filename(os.path.join(model_save_dir, f'{model_name}_loss.png'))
+    plt.savefig(loss_path)
     plt.close()
 
     # Plot Dice
@@ -91,7 +105,8 @@ def plot_metrics(metrics, model_name, save_dir):
     plt.title(f'{model_name.upper()} Dice Score')
     plt.legend()
     plt.grid(True)
-    plt.savefig(os.path.join(save_dir, f'{model_name}_dice.png'))
+    dice_path = get_unique_filename(os.path.join(model_save_dir, f'{model_name}_dice.png'))
+    plt.savefig(dice_path)
     plt.close()
 
     # Plot IoU
@@ -103,38 +118,38 @@ def plot_metrics(metrics, model_name, save_dir):
     plt.title(f'{model_name.upper()} IoU Score')
     plt.legend()
     plt.grid(True)
-    plt.savefig(os.path.join(save_dir, f'{model_name}_iou.png'))
+    iou_path = get_unique_filename(os.path.join(model_save_dir, f'{model_name}_iou.png'))
+    plt.savefig(iou_path)
     plt.close()
-
 
 def main():
     parser = argparse.ArgumentParser(description="Visualize training metrics")
-    parser.add_argument('--model', type=str, default='unet', help='Model name (unet, unetpp, deeplabv3)')
-    parser.add_argument('--csv', type=str, default=None, help='Path to metrics CSV file')
+    parser.add_argument('--model', type=str, default='unet', help='Model name (unet, pretrained_unet, unetpppretrained)')
     parser.add_argument('--log', type=str, default=None, help='Path to log file')
+    parser.add_argument('--checkpoint', type=str, default=None, help='Path to checkpoint file (optional for model validation)')
     args = parser.parse_args()
 
     model_name = args.model
     save_dir = os.path.join("results", "training_plots")
 
-    # Ưu tiên CSV nếu có
-    if args.csv and os.path.exists(args.csv):
-        metrics = read_metrics_csv(args.csv)
-    elif args.log and os.path.exists(args.log):
+    if args.log and os.path.exists(args.log):
         metrics = parse_log_file(args.log)
     else:
-        csv_file = os.path.join("logs", f"{model_name}_metrics.csv")
         log_file = os.path.join("logs", f"{model_name}.log")
-        if os.path.exists(csv_file):
-            metrics = read_metrics_csv(csv_file)
-        elif os.path.exists(log_file):
+        if os.path.exists(log_file):
             metrics = parse_log_file(log_file)
         else:
             raise FileNotFoundError(f"No metrics file found for {model_name}")
 
     plot_metrics(metrics, model_name, save_dir)
-    print(f"Training plots saved to {save_dir}")
+    print(f"Training plots saved to {get_unique_dir(os.path.join(save_dir, model_name))}")
 
+    # Optional: Load and validate model if checkpoint is provided
+    if args.checkpoint and os.path.exists(args.checkpoint):
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model = get_model(model_name, in_channels=1, out_channels=1).to(device)
+        load_checkpoint(args.checkpoint, model)
+        print(f"Model {model_name} loaded from checkpoint for validation.")
 
 if __name__ == "__main__":
     main()
