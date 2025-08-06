@@ -1,18 +1,19 @@
 import sys
 import os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+from datetime import datetime
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 from data.thyroid_dataset import ThyroidDataset, get_train_transform, get_val_transform
-from models.unet import Unet  # Thay UNetPlusPlus bằng PretrainedUNet
+from models.unetpp import UNetPlusPlus
 from losses import FocalTverskyLoss
 from myconfig1 import get_config
 from metrics import dice_score, iou_score, precision_score, recall_score
-
+from models.deeplabv3 import DeepLabV3
 
 def get_log_filename(log_dir, base_name="training_log.csv"):
     os.makedirs(log_dir, exist_ok=True)
@@ -25,7 +26,7 @@ def get_log_filename(log_dir, base_name="training_log.csv"):
     return csv_file
 
 
-def save_log(metrics, epoch, log_filename):
+def save_log(args, metrics, epoch, log_filename):
     df = pd.DataFrame([metrics])
     mode = 'w' if epoch == 1 else 'a'
     header = epoch == 1
@@ -74,20 +75,22 @@ def visualize_predictions(images, masks, outputs, args, epoch, num_images=4):
     plt.close()
 
 
-def train_one_epoch(model, train_loader, optimizer, criterion, device, args, epoch):
+def train_one_epoch(model, train_loader, optimizer, criterion, device):
     model.train()
     total_loss = 0
     dice_scores, iou_scores, prec_scores, rec_scores = [], [], [], []
 
     for batch in tqdm(train_loader, desc='Training'):
-        images, masks, fg_sizes = batch
-        images, masks, fg_sizes = images.to(device), masks.to(device), fg_sizes.to(device)
+        images, masks,_ = batch
+        images, masks= images.to(device), masks.to(device)
 
         optimizer.zero_grad()
         outputs = model(images)
         loss = criterion(outputs, masks)
+
+
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0) 
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
 
         total_loss += loss.item()
@@ -114,11 +117,14 @@ def validate(model, val_loader, criterion, device, args, epoch):
     vis_images, vis_masks, vis_outputs = None, None, None
     with torch.no_grad():
         for i, batch in enumerate(tqdm(val_loader, desc='Validating')):
-            images, masks, fg_sizes = batch
-            images, masks, fg_sizes = images.to(device), masks.to(device), fg_sizes.to(device)
+            images, masks, _ = batch
+            images, masks = images.to(device), masks.to(device)
 
             outputs = model(images)
             loss = criterion(outputs, masks)
+
+
+
             total_loss += loss.item()
 
             dice_scores.append(dice_score(outputs, masks))
@@ -139,6 +145,8 @@ def validate(model, val_loader, criterion, device, args, epoch):
         'val_precision': np.mean(prec_scores),
         'val_recall': np.mean(rec_scores)
     }
+
+
 
 
 def main():
@@ -185,15 +193,15 @@ def main():
         pin_memory=True
     )
 
-    model = Unet(
+    model = UNetPlusPlus(
+        num_classes=1,
         dropout_rate=args.dropout_rate,
         backbone=args.backbone,
-        in_channels=3,
-        out_channels=1,
-        pretrained=True
+        in_channels=3
     ).to(args.device)
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate,weight_decay=1e-5)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=1e-5)
+
 
     criterion = FocalTverskyLoss(
         alpha=0.5,
@@ -219,7 +227,7 @@ def main():
     start_epoch = 0
 
     for epoch in range(start_epoch, args.num_epochs):
-        train_metrics = train_one_epoch(model, train_loader, optimizer, criterion, args.device, args, epoch + 1)
+        train_metrics = train_one_epoch(model, train_loader, optimizer, criterion, args.device)
 
         val_metrics = validate(model, val_loader, criterion, args.device, args, epoch)
 
@@ -229,7 +237,7 @@ def main():
             **val_metrics
         }
 
-        save_log(metrics, epoch + 1, log_filename)
+        save_log(args, metrics, epoch + 1, log_filename)
 
         print(f'Epoch {epoch + 1}/{args.num_epochs}')
         print(
@@ -247,7 +255,6 @@ def main():
             if patience_counter >= args.patience:
                 print(f'Early stopping at epoch {epoch + 1}')
                 break
-
 
 
         if epoch < args.warmup_epochs:

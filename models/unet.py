@@ -1,128 +1,95 @@
 import torch
 import torch.nn as nn
 import torchvision.models as models
+import torch.nn.functional as F
+from torchvision.models import ResNet18_Weights, ResNet34_Weights, ResNet50_Weights
 
-class DoubleConv(nn.Module):
-    def __init__(self, in_channels, out_channels):
-        super(DoubleConv, self).__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, 3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(out_channels, out_channels, 3, padding=1),
-            nn.ReLU(inplace=True)
-        )
+class Unet(nn.Module):
+    def __init__(self, dropout_rate, backbone="resnet34", in_channels=3, out_channels=1, pretrained=True):
+        super(Unet, self).__init__()
 
-    def forward(self, x):
-        return self.conv(x)
+        if backbone == 'resnet50':
+            self.backbone = models.resnet50(weights=ResNet50_Weights.IMAGENET1K_V2 if pretrained else None)
+            encoder_channels = [64, 256, 512, 1024, 2048]
+        elif backbone == 'resnet34':
+            self.backbone = models.resnet34(weights=ResNet34_Weights.IMAGENET1K_V1 if pretrained else None)
+            encoder_channels = [64, 64, 128, 256, 512]
+        elif backbone == 'resnet18':
+            self.backbone = models.resnet18(weights=ResNet18_Weights.IMAGENET1K_V1 if pretrained else None)
+            encoder_channels = [64, 64, 128, 256, 512]  # Corrected
+        else:
+            raise ValueError(f"Unsupported backbone: {backbone}")
 
-class UNet(nn.Module):
-    def __init__(self, in_channels=1, out_channels=1, features=[64, 128, 256, 512]):
-        super(UNet, self).__init__()
-        self.downs = nn.ModuleList()
-        self.ups = nn.ModuleList()
-        self.pool = nn.MaxPool2d(2, 2)
+        self.backbone.fc = nn.Identity()
 
-        for feature in features:
-            self.downs.append(DoubleConv(in_channels, feature))
-            in_channels = feature
+        self.initial_conv = nn.Conv2d(in_channels, 64, kernel_size=7, stride=2, padding=3, bias=False)
 
-        for feature in reversed(features[:-1]):
-            self.ups.append(nn.ConvTranspose2d(feature * 2, feature, 2, 2))
-            self.ups.append(DoubleConv(feature * 2, feature))
+        if pretrained:
+            with torch.no_grad():
+                pretrained_conv1 = self.backbone.conv1.weight
+                if in_channels == 1:
+                    self.initial_conv.weight.copy_(pretrained_conv1.sum(dim=1, keepdim=True))
+                elif in_channels == 3:
+                    self.initial_conv.weight = nn.Parameter(pretrained_conv1.clone())
+                else:
+                    raise ValueError(f"Unsupported in_channels: {in_channels}. Use 1 or 3.")
 
-        self.bottleneck = DoubleConv(features[-1], features[-1] * 2)
-        self.final_conv = nn.Conv2d(features[0], out_channels, 1)
-
-    def forward(self, x):
-        skip_connections = []
-        for down in self.downs:
-            x = down(x)
-            skip_connections.append(x)
-            x = self.pool(x)
-
-        x = self.bottleneck(x)
-        skip_connections = skip_connections[::-1]
-
-        for idx in range(0, len(self.ups), 2):
-            x = self.ups[idx](x)
-            skip_connection = skip_connections[idx//2]
-            concat_skip = torch.cat((skip_connection, x), dim=1)
-            x = self.ups[idx+1](concat_skip)
-
-        return self.final_conv(x)
-
-
-class PretrainedUNet(nn.Module):
-    def __init__(self, encoder_name="resnet34", in_channels=1, out_channels=1, pretrained=True, dropout_rate=0.5):
-        super(PretrainedUNet, self).__init__()
-        # Load pretrained encoder
-        weights = 'IMAGENET1K_V1' if pretrained else None
-        self.encoder = models.__dict__[encoder_name](weights=weights)
-        self.encoder.conv1 = nn.Conv2d(in_channels, 64, kernel_size=7, stride=2, padding=3, bias=False)
-        self.encoder.fc = nn.Identity()
-
-        # Freeze encoder
-        for param in self.encoder.parameters():
-            param.requires_grad = False
-
-        # Encoder layers
-        self.enc_layers = list(self.encoder.children())[:-2]
-        self.enc_layers = nn.Sequential(*self.enc_layers)
-
-        # Decoder with additional upsampling to reach 256x256
-        self.upconv1 = nn.Sequential(
-            nn.Conv2d(512, 512, kernel_size=3, padding=1),
-            nn.BatchNorm2d(512),
-            nn.ReLU(inplace=True),
-            nn.ConvTranspose2d(512, 256, kernel_size=2, stride=2),  # Từ 64x64 lên 128x128
-            nn.BatchNorm2d(256),
-            nn.ReLU(inplace=True),
-            nn.Dropout(dropout_rate)
-        )
-        self.upconv2 = nn.Sequential(
-            nn.Conv2d(512, 256, kernel_size=3, padding=1),  # 512 (256 + 256 từ skip) -> 256
-            nn.BatchNorm2d(256),
-            nn.ReLU(inplace=True),
-            nn.ConvTranspose2d(256, 128, kernel_size=2, stride=2),  # Từ 128x128 lên 256x256
-            nn.BatchNorm2d(128),
-            nn.ReLU(inplace=True),
-            nn.Dropout(dropout_rate)
-        )
-        self.upconv3 = nn.Sequential(
-            nn.Conv2d(256, 128, kernel_size=3, padding=1),  # 256 (128 + 128 từ skip) -> 128
-            nn.BatchNorm2d(128),
-            nn.ReLU(inplace=True),
-            nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2),   # Từ 256x256 lên 512x512 (sẽ điều chỉnh sau)
-            nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True),
-            nn.Dropout(dropout_rate)
-        )
-        self.reduce_channels = nn.Sequential(
-            nn.Conv2d(128, 64, kernel_size=1),  # Giảm từ 128 (64 + 64 từ skip) xuống 64
-            nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True)
-        )
-        self.conv_final = nn.Conv2d(64, out_channels, kernel_size=1)
-
-    def forward(self, x):
-        # Encoder
-        enc_features = []
-        for layer in self.enc_layers:
-            x = layer(x)
-            enc_features.append(x)
+        self.enc1 = nn.Sequential(self.initial_conv, self.backbone.bn1, self.backbone.relu, self.backbone.maxpool)
+        self.enc2 = self.backbone.layer1
+        self.enc3 = self.backbone.layer2
+        self.enc4 = self.backbone.layer3
+        self.enc5 = self.backbone.layer4
 
         # Decoder
-        x = self.upconv1(enc_features[-1])  # Từ [16, 512, 64, 64] -> [16, 256, 128, 128]
-        x = torch.cat([x, enc_features[-2]], dim=1)  # Concat với [16, 256, 128, 128] -> [16, 512, 128, 128]
-        x = self.upconv2(x)  # Từ [16, 512, 128, 128] -> [16, 128, 256, 256]
-        x = torch.cat([x, enc_features[-3]], dim=1)  # Concat với [16, 128, 256, 256] -> [16, 256, 256, 256]
-        x = self.upconv3(x)  # Từ [16, 256, 256, 256] -> [16, 64, 512, 512]
-        x = torch.cat([x, enc_features[-4]], dim=1)  # Concat với [16, 64, 256, 256] -> [16, 128, 512, 512]
-        # Điều chỉnh kích thước về 256x256
-        x = nn.functional.interpolate(x, size=(256, 256), mode='bilinear', align_corners=False)
-        x = self.reduce_channels(x)  # Giảm từ 128 kênh xuống 64 kênh
-        x = self.conv_final(x)
+        self.up1 = self._upsample_block(encoder_channels[4], encoder_channels[3], dropout_rate)  # 512 -> 256
+        self.up2 = self._upsample_block(encoder_channels[3], encoder_channels[2], dropout_rate)  # 256 -> 128
+        self.up3 = self._upsample_block(encoder_channels[2], encoder_channels[1], dropout_rate)  # 128 -> 64
+        self.up4 = self._upsample_block(encoder_channels[1], encoder_channels[0], dropout_rate)  # 64 -> 64
 
-        return x
+        self.final_up = nn.Sequential(
+            nn.ConvTranspose2d(encoder_channels[0], 64, kernel_size=2, stride=2),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout_rate),
+        )
+        self.final_conv = nn.Conv2d(64, out_channels, kernel_size=1)
+    def _upsample_block(self, in_channels, out_channels, dropout):
+        return nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.ConvTranspose2d(out_channels, out_channels, kernel_size=2, stride=2),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+        )
 
+    def forward(self, x):
+        x1 = self.enc1(x)  # 64x64
+        x2 = self.enc2(x1)  # 64x64
+        x3 = self.enc3(x2)  # 32x32
+        x4 = self.enc4(x3)  # 16x16
+        x5 = self.enc5(x4)  # 8x8
 
+        d4 = self.up1(x5)  # 512 -> 256, 8x8 -> 16x16
+        if d4.shape[2:] != x4.shape[2:]:
+            x4 = F.interpolate(x4, size=d4.shape[2:], mode='bilinear', align_corners=False)
+        d4 = d4 + x4
+
+        d3 = self.up2(d4)  # 256 -> 128, 16x16 -> 32x32
+        if d3.shape[2:] != x3.shape[2:]:
+            x3 = F.interpolate(x3, size=d3.shape[2:], mode='bilinear', align_corners=False)
+        d3 = d3 + x3
+
+        d2 = self.up3(d3)  # 128 -> 64, 32x32 -> 64x64
+        if d2.shape[2:] != x2.shape[2:]:
+            x2 = F.interpolate(x2, size=d2.shape[2:], mode='bilinear', align_corners=False)
+        d2 = d2 + x2
+
+        d1 = self.up4(d2)  # 64 -> 64, 64x64 -> 128x128
+        if d1.shape[2:] != x1.shape[2:]:
+            x1 = F.interpolate(x1, size=d1.shape[2:], mode='bilinear', align_corners=False)
+        d1 = d1 + x1
+
+        out = self.final_up(d1)  # 64 -> 64, 128x128 -> 256x256
+        return self.final_conv(out)

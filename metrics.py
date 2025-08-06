@@ -1,32 +1,44 @@
 import torch
 
-def dice_score(pred, target, smooth=1e-6):
-    """Tính Dice coefficient."""
-    pred = pred.contiguous().view(-1)
-    target = target.contiguous().view(-1)
-    intersection = (pred * target).sum()
-    return (2. * intersection + smooth) / (pred.sum() + target.sum() + smooth)
 
-def iou_score(pred, target, smooth=1e-6):
-    """Tính IoU (Intersection over Union)."""
-    pred = pred.contiguous().view(-1)
-    target = target.contiguous().view(-1)
-    intersection = (pred * target).sum()
-    union = pred.sum() + target.sum() - intersection
-    return (intersection + smooth) / (union + smooth)
+def dice_score(pred, target, eps=1e-7):
+    pred = torch.sigmoid(pred) > 0.5
+    target = target > 0.5
+    # Đảm bảo batch size giống nhau
+    minibatch = min(pred.shape[0], target.shape[0])
+    pred = pred[:minibatch]
+    target = target[:minibatch]
+    inter = (pred & target).float().sum((1,2,3))
+    union = pred.float().sum((1,2,3)) + target.float().sum((1,2,3))
+    return ((2 * inter + eps) / (union + eps)).mean().item()
 
-def precision_score(pred, target, smooth=1e-6):
-    """Tính Precision."""
-    pred = pred.contiguous().view(-1)
-    target = target.contiguous().view(-1)
-    true_positive = (pred * target).sum()
-    predicted_positive = pred.sum()
-    return (true_positive + smooth) / (predicted_positive + smooth)
+def iou_score(pred, target, eps=1e-7):
+    pred = torch.sigmoid(pred) > 0.5
+    target = target > 0.5
+    # Đảm bảo batch size giống nhau
+    minibatch = min(pred.shape[0], target.shape[0])
+    pred = pred[:minibatch]
+    target = target[:minibatch]
+    inter = (pred & target).float().sum((1,2,3))
+    union = (pred | target).float().sum((1,2,3))
+    return ((inter + eps) / (union + eps)).mean().item()
 
-def recall_score(pred, target, smooth=1e-6):
-    """Tính Recall."""
-    pred = pred.contiguous().view(-1)
-    target = target.contiguous().view(-1)
-    true_positive = (pred * target).sum()
-    actual_positive = target.sum()
-    return (true_positive + smooth) / (actual_positive + smooth)
+def precision_score(pred, target, eps=1e-7):
+    pred = torch.sigmoid(pred) > 0.5
+    target = target > 0.5
+    minibatch = min(pred.shape[0], target.shape[0])
+    pred = pred[:minibatch]
+    target = target[:minibatch]
+    true_positives = (pred & target).float().sum((1, 2, 3))
+    predicted_positives = pred.float().sum((1, 2, 3))
+    return ((true_positives + eps) / (predicted_positives + eps)).mean().item()
+
+def recall_score(pred, target, eps=1e-7):
+    pred = torch.sigmoid(pred) > 0.5
+    target = target > 0.5
+    minibatch = min(pred.shape[0], target.shape[0])
+    pred = pred[:minibatch]
+    target = target[:minibatch]
+    true_positives = (pred & target).float().sum((1, 2, 3))
+    actual_positives = target.float().sum((1, 2, 3))
+    return ((true_positives + eps) / (actual_positives + eps)).mean().item()

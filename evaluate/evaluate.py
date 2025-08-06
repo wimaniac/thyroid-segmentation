@@ -1,116 +1,85 @@
-import argparse
 import torch
-import yaml
 from torch.utils.data import DataLoader
-import os
+from torchvision import transforms
 import sys
-
+import os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+from myconfig1 import get_config
+from data.thyroid_dataset import ThyroidDataset, get_test_transform
 from metrics import dice_score, iou_score, precision_score, recall_score
-from models.unet import UNet, PretrainedUNet
+from models.unet import Unet
 from models.unetpp import UNetPlusPlus
-from train.utils import load_checkpoint
-from data.thyroid_dataset import ThyroidDataset, get_default_transform
+from models.deeplabv3 import DeepLabV3
 
-def accuracy_score(pred, target):
-    """Tính accuracy cho phân đoạn."""
-    preds = torch.sigmoid(pred) > 0.5  # Áp dụng ngưỡng 0.5
-    correct = (preds == target).float().sum()  # Số pixel đúng
-    total = target.numel()  # Tổng số pixel
-    return correct / total
-
-def get_model(model_name, in_channels=1, out_channels=1):
-    """Khởi tạo mô hình dựa trên tên."""
-    model_map = {
-        'unet': UNet,
-        'pretrained_unet': PretrainedUNet,
-        'unetpppretrained': UNetPlusPlus,
-    }
-    if model_name not in model_map:
-        raise ValueError(f"Mô hình {model_name} không được hỗ trợ. Chọn từ {list(model_map.keys())}")
-
-    if model_name == 'unetpppretrained':
-        # UNetPlusPlus sử dụng num_classes thay vì in_channels/out_channels
-        return model_map[model_name](num_classes=out_channels)
+def load_model(model_path, model_type, device, in_channels=1, out_channels=1, backbone='resnet34', dropout_rate=0.5):
+    if model_type == 'unet':
+        model = Unet(dropout_rate=dropout_rate, backbone=backbone, in_channels=in_channels, out_channels=out_channels)
+    elif model_type == 'unetpp':
+        model = UNetPlusPlus(num_classes=out_channels, dropout_rate=dropout_rate, backbone=backbone, in_channels=in_channels)
+    elif model_type == 'deeplabv3':
+        model = DeepLabV3(num_classes=out_channels, in_channels=in_channels, backbone=backbone, dropout=dropout_rate)
     else:
-        return model_map[model_name](in_channels=in_channels, out_channels=out_channels)
+        raise ValueError(f"Unsupported model type: {model_type}")
 
-def evaluate_model(model, loader, device):
-    """Đánh giá mô hình trên tập dữ liệu với metrics tùy chỉnh."""
+    state_dict = torch.load(model_path, map_location=device)
+    model.load_state_dict(state_dict['model_state_dict'])
+    model.to(device)
     model.eval()
-    total_dice = 0
-    total_iou = 0
-    total_precision = 0
-    total_recall = 0
-    total_accuracy = 0
-    num_batches = len(loader)
+    return model
+
+def evaluate_model(model, test_loader, device):
+    model.eval()
+    dice_scores, iou_scores, prec_scores, rec_scores = [], [], [], []
 
     with torch.no_grad():
-        for data, targets, _ in loader:
-            data = data.to(device)
-            targets = targets.to(device)
-
-            predictions = model(data)
-            # Nếu mô hình trả về danh sách/tuple (deep supervision), lấy đầu ra cuối cùng
-            if isinstance(predictions, (list, tuple)):
-                predictions = predictions[-1]  # Chỉ sử dụng đầu ra chính
-
-            preds = torch.sigmoid(predictions) > 0.5
-
-            total_dice += dice_score(preds, targets).item()
-            total_iou += iou_score(preds, targets).item()
-            total_precision += precision_score(preds, targets).item()
-            total_recall += recall_score(preds, targets).item()
-            total_accuracy += accuracy_score(predictions, targets).item()
+        for images, masks, _ in test_loader:
+            images, masks = images.to(device), masks.to(device)
+            outputs = model(images)
+            dice_scores.append(dice_score(outputs, masks))
+            iou_scores.append(iou_score(outputs, masks))
+            prec_scores.append(precision_score(outputs, masks))
+            rec_scores.append(recall_score(outputs, masks))
 
     return {
-        'dice': total_dice / num_batches,
-        'iou': total_iou / num_batches,
-        'precision': total_precision / num_batches,
-        'recall': total_recall / num_batches,
-        'accuracy': total_accuracy / num_batches
+        'dice': sum(dice_scores) / len(dice_scores),
+        'iou': sum(iou_scores) / len(iou_scores),
+        'precision': sum(prec_scores) / len(prec_scores),
+        'recall': sum(rec_scores) / len(rec_scores)
     }
 
 def main():
-    # Parse arguments
-    parser = argparse.ArgumentParser(description="Đánh giá mô hình trên tập dữ liệu test")
-    parser.add_argument('--model', type=str, default=None, help='Tên mô hình (unet, pretrained_unet, unetpppretrained)')
-    parser.add_argument('--checkpoint', type=str, default=None, help='Đường dẫn đến file checkpoint')
-    args = parser.parse_args()
+    args = get_config()
+    device = torch.device(args.device if torch.cuda.is_available() and args.device == 'cuda' else 'cpu')
 
-    # Load config
-    with open("config.yaml", "r") as f:
-        config = yaml.safe_load(f)
+    # Giả định mô hình đã được huấn luyện và lưu với checkpoint
+    model_path = os.path.join(args.checkpoint_dir, 'best_model.pth')
+    if not os.path.exists(model_path):
+        print(f"Model checkpoint not found at {model_path}. Please provide a valid path.")
+        return
 
-    # Setup
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    transform = get_default_transform(train=False)  # Sử dụng transform từ thyroid_dataset.py
-
-    # Test dataset
+    # Tải dữ liệu test
     test_dataset = ThyroidDataset(
-        image_dir=config["data"]["processed"]["image"]["test"],
-        mask_dir=config["data"]["processed"]["mask"]["test"],
-        transform=transform,
-        mask_suffix=".jpg"
+        image_dir=args.test_image_dir,
+        mask_dir=args.test_mask_dir,
+        transform=get_test_transform(),
+        rgb= True
     )
-    test_loader = DataLoader(test_dataset, batch_size=config["training"]["batch_size"], shuffle=False, num_workers=4)
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=True
+    )
 
-    # Load model
-    model_name = args.model if args.model else config["model"]["name"]
-    checkpoint_path = args.checkpoint if args.checkpoint else os.path.join("checkpoints", model_name,
-                                                                           f"best_{model_name}.pth")
-    model = get_model(model_name, in_channels=1, out_channels=1).to(device)
-    checkpoint_info = load_checkpoint(model, filename=checkpoint_path)
-    print(f"Tải checkpoint từ {checkpoint_path}")
+    # Tải mô hình
+    model = load_model(model_path, args.model, device, in_channels=3, out_channels=1, backbone=args.backbone, dropout_rate=args.dropout_rate)
 
-    # Evaluate
-    results = evaluate_model(model, test_loader, device)
-    print(f"{model_name.upper()} Test Results:")
-    print(f"Dice: {results['dice']:.4f}")
-    print(f"IoU: {results['iou']:.4f}")
-    print(f"Precision: {results['precision']:.4f}")
-    print(f"Recall: {results['recall']:.4f}")
-    print(f"Accuracy: {results['accuracy']:.4f}")  # Thêm in accuracy
+    # Đánh giá
+    metrics = evaluate_model(model, test_loader, device)
+    print(f"Evaluation Metrics on Test Set:")
+    for metric, value in metrics.items():
+        print(f"{metric.capitalize()}: {value:.4f}")
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

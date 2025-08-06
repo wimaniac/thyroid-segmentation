@@ -1,115 +1,130 @@
-import argparse
 import torch
-import yaml
 from torch.utils.data import DataLoader
+from torchvision import transforms
 import os
 import sys
-
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-from PIL import Image
+import cv2
 import numpy as np
-from models.unet import UNet, PretrainedUNet
-from train.utils import load_checkpoint
-from data.thyroid_dataset import ThyroidDataset, get_default_transform
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+from myconfig1 import get_config
+from data.thyroid_dataset import ThyroidDataset, get_test_transform
+from models.unet import Unet
 from models.unetpp import UNetPlusPlus
-
-
-def get_unique_filename(base_path):
-    """Tạo tên file duy nhất bằng cách thêm số thứ tự nếu file đã tồn tại."""
-    base, ext = os.path.splitext(base_path)
-    counter = 1
-    new_path = base_path
-    while os.path.exists(new_path):
-        new_path = f"{base}_{counter}{ext}"
-        counter += 1
-    return new_path
-
-
-def get_unique_dir(base_dir):
-    """Tạo tên thư mục duy nhất bằng cách thêm số thứ tự nếu thư mục đã tồn tại."""
-    counter = 1
-    new_dir = base_dir
-    while os.path.exists(new_dir):
-        new_dir = f"{base_dir}_{counter}"
-        counter += 1
-    return new_dir
-
-
-def get_model(model_name, in_channels=1, out_channels=1):
-    """Khởi tạo mô hình dựa trên tên."""
-    model_map = {
-        'unet': UNet,
-        'pretrained_unet': PretrainedUNet,
-        'unetpppretrained': UNetPlusPlus,
-    }
-    if model_name not in model_map:
-        raise ValueError(f"Mô hình {model_name} không được hỗ trợ. Chọn từ {list(model_map.keys())}")
-
-    if model_name == 'unetpppretrained':
-        # UNetPlusPlus sử dụng num_classes thay vì in_channels/out_channels
-        return model_map[model_name](num_classes=out_channels)
+from models.deeplabv3 import DeepLabV3
+import pydensecrf.densecrf as dcrf
+from pydensecrf.utils import unary_from_softmax, create_pairwise_bilateral
+def load_model(model_path, model_type, device, in_channels=3, out_channels=1, backbone='resnet18', dropout_rate=0.5):
+    if model_type == 'unet':
+        model = Unet(dropout_rate=dropout_rate, backbone=backbone, in_channels=in_channels, out_channels=out_channels)
+    elif model_type == 'unetpp':
+        model = UNetPlusPlus(num_classes=out_channels, dropout_rate=dropout_rate, backbone=backbone, in_channels=in_channels)
+    elif model_type == 'deeplabv3':
+        model = DeepLabV3(num_classes=out_channels, in_channels=in_channels, backbone=backbone, dropout=dropout_rate)
     else:
-        return model_map[model_name](in_channels=in_channels, out_channels=out_channels)
+        raise ValueError(f"Unsupported model type: {model_type}")
 
-
-def predict(model, loader, device, output_dir):
-    """Dự đoán và lưu kết quả phân đoạn."""
+    state_dict = torch.load(model_path, map_location=device, weights_only=True)
+    model.load_state_dict(state_dict['model_state_dict'])
+    model.to(device)
     model.eval()
-    os.makedirs(output_dir, exist_ok=True)
+    return model
+
+def smooth_mask(pred_mask, sigma=2):
+    blurred = cv2.GaussianBlur(pred_mask.astype(np.float32), (0, 0), sigma)
+    smoothed_mask = (blurred > 127).astype(np.uint8) * 255
+    return smoothed_mask
+
+def apply_crf(image, prob, t=5, sxy=80, srgb=13):
+    n_classes = 2
+    d = dcrf.DenseCRF2D(image.shape[1], image.shape[0], n_classes)
+    U = unary_from_softmax(prob)
+    d.setUnaryEnergy(U)
+    d.addPairwiseGaussian(sxy=3, compat=3)
+    d.addPairwiseBilateral(sxy=sxy, srgb=srgb, rgbim=image, compat=10)
+    Q = d.inference(t)
+    return np.argmax(Q, axis=0).reshape(image.shape[:2]).astype(np.uint8) * 255
+
+def ensemble_predict(models, image, device):
+    probs = []
+    for model in models:
+        model.eval()
+        with torch.no_grad():
+            prob = torch.sigmoid(model(image)).cpu().numpy()
+            probs.append(prob)
+    avg_prob = np.mean(probs, axis=0)
+    return (avg_prob > 0.5).astype(np.uint8) * 255
+
+def normalize_mask(pred_mask):
+    pred_mask = np.clip(pred_mask, 0, 255)
+    pred_mask = (pred_mask > 127).astype(np.uint8) * 255
+    return pred_mask
+
+def fill_holes(pred_mask, kernel_size=5):
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+    return cv2.morphologyEx(pred_mask, cv2.MORPH_CLOSE, kernel)
+
+def remove_small_regions(pred_mask, min_area=100):
+    _, labels, stats, _ = cv2.connectedComponentsWithStats(pred_mask, connectivity=8)
+    for label in range(1, len(stats)):
+        if stats[label, cv2.CC_STAT_AREA] < min_area:
+            pred_mask[labels == label] = 0
+    return pred_mask
+def infer_model(model, test_loader, device, pred_dir=None):
+    model.eval()
+    os.makedirs(pred_dir, exist_ok=True) if pred_dir else None
 
     with torch.no_grad():
-        for data, _, img_names in loader:  # Lấy img_names từ dataset
-            data = data.to(device)
-            predictions = model(data)
-            preds = torch.sigmoid(predictions) > 0.5
-            preds = preds.cpu().numpy().squeeze()
+        for i, (images, _, image_paths) in enumerate(test_loader):
+            images = images.to(device)
+            outputs = model(images)
+            outputs = torch.sigmoid(outputs)
 
-            for i, pred in enumerate(preds):
-                pred_img = (pred * 255).astype(np.uint8)
-                # Tạo tên file dự đoán dựa trên tên ảnh gốc
-                base_name = os.path.splitext(img_names[i])[0]  # Lấy tên file không đuôi
-                pred_path = get_unique_filename(os.path.join(output_dir, f"pred_{base_name}.jpg"))
-                Image.fromarray(pred_img).save(pred_path)
+            for j in range(outputs.size(0)):
+                pred_mask = outputs[j].cpu().numpy().squeeze()
 
+                # Áp dụng hậu xử lý
+                pred_mask = (pred_mask > 0.5).astype(np.float32) * 255  # Nhị phân hóa
+                pred_mask = smooth_mask(pred_mask, sigma=2)  # Làm mịn
+                pred_mask = remove_small_regions(pred_mask, min_area=100)  # Loại bỏ nhiễu
+                pred_mask = fill_holes(pred_mask, kernel_size=5)  # Điền lỗ
+                pred_mask = normalize_mask(pred_mask)  # Chuẩn hóa
+
+                if pred_dir:
+                    filename = os.path.basename(image_paths[j])
+                    mask_path = os.path.join(pred_dir, f"{filename}")
+                    cv2.imwrite(mask_path, pred_mask)
 
 def main():
-    # Parse arguments
-    parser = argparse.ArgumentParser(description="Chạy dự đoán với mô hình được chỉ định")
-    parser.add_argument('--model', type=str, default=None, help='Tên mô hình (unet, pretrained_unet, unetpppretrained)')
-    parser.add_argument('--checkpoint', type=str, default=None, help='Đường dẫn đến file checkpoint')
-    args = parser.parse_args()
+    args = get_config()
+    device = torch.device(args.device if torch.cuda.is_available() and args.device == 'cuda' else 'cpu')
 
-    # Load config
-    with open("config.yaml", "r") as f:
-        config = yaml.safe_load(f)
+    # Giả định mô hình đã được huấn luyện và lưu với checkpoint
+    model_path = os.path.join(args.checkpoint_dir, 'best_model.pth')
+    if not os.path.exists(model_path):
+        print(f"Model checkpoint not found at {model_path}. Please provide a valid path.")
+        return
 
-    # Setup
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    transform = get_default_transform(train=False)  # Sử dụng transform từ thyroid_dataset.py
-
-    # Test dataset
+    # Tải dữ liệu test
     test_dataset = ThyroidDataset(
-        image_dir=config["data"]["processed"]["image"]["test"],
-        mask_dir=config["data"]["processed"]["mask"]["test"],
-        transform=transform,
-        mask_suffix=".jpg"
+        image_dir=args.test_image_dir,
+        mask_dir=args.test_mask_dir,  # Không cần mask để inference, nhưng giữ để tương thích
+        transform=get_test_transform(),
+        rgb=True  # Đảm bảo xử lý ảnh 3 kênh
     )
-    test_loader = DataLoader(test_dataset, batch_size=config["training"]["batch_size"], shuffle=False, num_workers=4)
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=True
+    )
 
-    # Load model
-    model_name = args.model if args.model else config["model"]["name"]
-    checkpoint_path = args.checkpoint if args.checkpoint else os.path.join("checkpoints", model_name,
-                                                                           f"best_{model_name}.pth")
-    model = get_model(model_name, in_channels=1, out_channels=1).to(device)
-    checkpoint_info = load_checkpoint(model, filename=checkpoint_path)
-    print(
-        f"Tải checkpoint từ {checkpoint_path}")
+    # Tải mô hình
+    model = load_model(model_path, args.model, device, in_channels=3, out_channels=1, backbone=args.backbone, dropout_rate=args.dropout_rate)
 
-    # Predict
-    output_dir = get_unique_dir(os.path.join("results", "predictions", model_name))
-    predict(model, test_loader, device, output_dir)
-    print(f"Dự đoán được lưu tại {output_dir}")
+    # Thực hiện inference
+    infer_model(model, test_loader, device, pred_dir=args.pred_dir)
+    print(f"Inference completed. Predictions saved to {args.pred_dir} if specified.")
 
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
